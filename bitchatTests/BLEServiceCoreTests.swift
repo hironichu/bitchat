@@ -23,10 +23,18 @@ struct BLEServiceCoreTests {
         let packet = makePublicPacket(content: "Hello", sender: sender, timestamp: timestamp)
 
         ble._test_handlePacket(packet, fromPeerID: sender)
-        ble._test_handlePacket(packet, fromPeerID: sender)
+        let receivedFirst = await TestHelpers.waitUntil(
+            { delegate.publicMessagesSnapshot().count == 1 },
+            timeout: TestConstants.defaultTimeout
+        )
+        #expect(receivedFirst)
 
-        _ = await TestHelpers.waitUntil({ delegate.publicMessagesSnapshot().count == 1 },
-                                        timeout: TestConstants.shortTimeout)
+        ble._test_handlePacket(packet, fromPeerID: sender)
+        let receivedDuplicate = await TestHelpers.waitUntil(
+            { delegate.publicMessagesSnapshot().count > 1 },
+            timeout: TestConstants.shortTimeout
+        )
+        #expect(!receivedDuplicate)
 
         let messages = delegate.publicMessagesSnapshot()
         #expect(messages.count == 1)
@@ -49,13 +57,52 @@ struct BLEServiceCoreTests {
         #expect(!didReceive)
         #expect(delegate.publicMessagesSnapshot().isEmpty)
     }
+
+    @Test
+    func announceSenderMismatch_isRejected() async throws {
+        let ble = makeService()
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let announcement = AnnouncementPacket(
+            nickname: "Spoof",
+            noisePublicKey: signer.getStaticPublicKeyData(),
+            signingPublicKey: signer.getSigningPublicKeyData(),
+            directNeighbors: nil
+        )
+        let payload = try #require(announcement.encode(), "Failed to encode announcement")
+
+        let derivedPeerID = PeerID(publicKey: announcement.noisePublicKey)
+        let wrongFirst = derivedPeerID.bare.first == "0" ? "1" : "0"
+        let wrongBare = String(wrongFirst) + String(derivedPeerID.bare.dropFirst())
+        let wrongPeerID = PeerID(str: wrongBare)
+        let packet = BitchatPacket(
+            type: MessageType.announce.rawValue,
+            senderID: Data(hexString: wrongPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil,
+            ttl: 7
+        )
+        let signed = try #require(signer.signPacket(packet), "Failed to sign announce packet")
+
+        ble._test_handlePacket(signed, fromPeerID: wrongPeerID, preseedPeer: false)
+
+        _ = await TestHelpers.waitUntil({ !ble.currentPeerSnapshots().isEmpty }, timeout: 0.3)
+        #expect(ble.currentPeerSnapshots().isEmpty)
+    }
 }
 
 private func makeService() -> BLEService {
     let keychain = MockKeychain()
     let identityManager = MockIdentityManager(keychain)
     let idBridge = NostrIdentityBridge(keychain: MockKeychainHelper())
-    return BLEService(keychain: keychain, idBridge: idBridge, identityManager: identityManager)
+    return BLEService(
+        keychain: keychain,
+        idBridge: idBridge,
+        identityManager: identityManager,
+        initializeBluetoothManagers: false
+    )
 }
 
 private func makePublicPacket(content: String, sender: PeerID, timestamp: UInt64) -> BitchatPacket {
