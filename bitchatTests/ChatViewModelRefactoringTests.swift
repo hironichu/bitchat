@@ -8,6 +8,7 @@
 
 import Testing
 import Foundation
+import BitFoundation
 @testable import bitchat
 
 struct ChatViewModelRefactoringTests {
@@ -137,7 +138,7 @@ struct ChatViewModelRefactoringTests {
         // Wait for async processing with proper timeout
         let found = await TestHelpers.waitUntil(
             {
-                viewModel.timelineStore.messages(for: .mesh).contains(where: { $0.content == "Public Hi" })
+                viewModel.publicMessages(for: .mesh).contains(where: { $0.content == "Public Hi" })
             },
             timeout: TestConstants.defaultTimeout
         )

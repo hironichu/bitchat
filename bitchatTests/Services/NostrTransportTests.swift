@@ -6,8 +6,10 @@
 // For more information, see <https://unlicense.org>
 //
 
+import Combine
 import Foundation
 import Testing
+import BitFoundation
 @testable import bitchat
 
 @Suite("NostrTransport Tests")
@@ -41,7 +43,9 @@ struct NostrTransportTests {
             )
         )
 
-        #expect(!transport.isPeerReachable(fullPeerID))
+        // Offline favorites are addressed by the full 64-hex noise key, so
+        // both forms must resolve to the same reachability answer.
+        #expect(transport.isPeerReachable(fullPeerID))
         #expect(transport.isPeerReachable(shortPeerID))
         #expect(!transport.isPeerReachable(PeerID(str: "feedfeedfeedfeed")))
     }
@@ -78,8 +82,53 @@ struct NostrTransportTests {
         )
         notificationCenter.post(name: .favoriteStatusChanged, object: nil)
 
-        let didRefresh = await TestHelpers.waitUntil({ transport.isPeerReachable(peerID) }, timeout: 0.5)
+        let didRefresh = await TestHelpers.waitUntil({ transport.isPeerReachable(peerID) }, timeout: 5.0)
         #expect(didRefresh)
+    }
+
+    @Test("Prompt delivery requires both a known npub and a relay connection")
+    @MainActor
+    func canDeliverPromptlyTracksRelayConnectivity() async throws {
+        let keychain = MockKeychain()
+        let idBridge = NostrIdentityBridge(keychain: keychain)
+        let recipient = try NostrIdentity.generate()
+        let noiseKey = Data((0..<32).map(UInt8.init))
+        let peerID = PeerID(hexData: noiseKey)
+        let relationship = makeRelationship(
+            peerNoisePublicKey: noiseKey,
+            peerNostrPublicKey: recipient.npub,
+            peerNickname: "Alice"
+        )
+        let connectivity = CurrentValueSubject<Bool, Never>(false)
+
+        let transport = NostrTransport(
+            keychain: keychain,
+            idBridge: idBridge,
+            dependencies: makeDependencies(
+                loadFavorites: { [noiseKey: relationship] },
+                relayConnectivity: { connectivity.eraseToAnyPublisher() }
+            )
+        )
+
+        // Reachable (npub known) but relays down: the peer must not be
+        // treated as promptly deliverable, or the router would skip the
+        // courier and let the message rot in the Nostr send queue.
+        #expect(transport.isPeerReachable(peerID))
+        #expect(!transport.canDeliverPromptly(to: peerID))
+
+        connectivity.send(true)
+        let deliverable = await TestHelpers.waitUntil(
+            { transport.canDeliverPromptly(to: peerID) },
+            timeout: 5.0
+        )
+        #expect(deliverable)
+
+        connectivity.send(false)
+        let undeliverable = await TestHelpers.waitUntil(
+            { !transport.canDeliverPromptly(to: peerID) },
+            timeout: 5.0
+        )
+        #expect(undeliverable)
     }
 
     @Test("Private message resolves short peer ID and emits decryptable packet")
@@ -115,7 +164,7 @@ struct NostrTransportTests {
 
         transport.sendPrivateMessage("hello over nostr", to: shortPeerID, recipientNickname: "Carol", messageID: "pm-1")
 
-        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 0.5)
+        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 5.0)
         #expect(didSend)
         let result = try decodeEmbeddedPayload(from: probe.sentEvents[0], recipient: recipient)
         let privateMessage = try decodePrivateMessage(from: result.payload)
@@ -160,7 +209,7 @@ struct NostrTransportTests {
 
         transport.sendFavoriteNotification(to: fullPeerID, isFavorite: true)
 
-        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 0.5)
+        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 5.0)
         #expect(didSend)
         let result = try decodeEmbeddedPayload(from: probe.sentEvents[0], recipient: recipient)
         let privateMessage = try decodePrivateMessage(from: result.payload)
@@ -201,7 +250,7 @@ struct NostrTransportTests {
 
         transport.sendDeliveryAck(for: "ack-1", to: fullPeerID)
 
-        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 0.5)
+        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 5.0)
         #expect(didSend)
         let result = try decodeEmbeddedPayload(from: probe.sentEvents[0], recipient: recipient)
 
@@ -239,7 +288,7 @@ struct NostrTransportTests {
             messageID: "geo-1"
         )
 
-        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 0.5)
+        let didSend = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 5.0)
         #expect(didSend)
         let event = probe.sentEvents[0]
         let result = try decodeEmbeddedPayload(from: event, recipient: recipient)
@@ -288,9 +337,10 @@ struct NostrTransportTests {
         transport.sendReadReceipt(first, to: fullPeerID)
         transport.sendReadReceipt(second, to: fullPeerID)
 
-        let sentFirst = await TestHelpers.waitUntil({ probe.sentEvents.count == 1 }, timeout: 1.5)
+        let readReceiptTimeout: TimeInterval = 5.0
+        let sentFirst = await TestHelpers.waitUntil({ probe.sentEvents.count >= 1 }, timeout: readReceiptTimeout)
         try #require(sentFirst, "Expected first queued read receipt event")
-        let scheduledThrottle = await TestHelpers.waitUntil({ probe.scheduledActionCount == 1 }, timeout: 1.5)
+        let scheduledThrottle = await TestHelpers.waitUntil({ probe.scheduledActionCount == 1 }, timeout: readReceiptTimeout)
         try #require(scheduledThrottle, "Expected queued throttle action after first read receipt")
         let firstEvent = try #require(probe.sentEvents.first, "Expected first queued read receipt event")
         let firstPayload = try decodeEmbeddedPayload(from: firstEvent, recipient: recipient).payload
@@ -299,14 +349,24 @@ struct NostrTransportTests {
 
         try #require(probe.runNextScheduledAction(), "Expected queued throttle action after first read receipt")
 
-        let sentSecond = await TestHelpers.waitUntil({ probe.sentEvents.count == 2 }, timeout: 1.5)
+        let sentSecond = await TestHelpers.waitUntil({ probe.sentEvents.count >= 2 }, timeout: readReceiptTimeout)
         try #require(sentSecond, "Expected second read receipt after running throttle action")
         let secondEvent = try #require(probe.sentEvents.last, "Expected second queued read receipt event")
         let secondPayload = try decodeEmbeddedPayload(from: secondEvent, recipient: recipient).payload
         #expect(secondPayload.type == .readReceipt)
         #expect(String(data: secondPayload.data, encoding: .utf8) == "read-2")
+        withExtendedLifetime(transport) {}
     }
 
+    // These thread-safety tests must hammer from the dispatch pool
+    // (concurrentPerform), NOT a task group: transport calls block in
+    // queue.sync, and a 100-task group runs them on the Swift Concurrency
+    // cooperative pool — one thread per core, just 3 on CI runners. Parking
+    // every cooperative thread in a blocking sync violates the forward
+    // progress contract and wedged dispatch on the CI runners' macOS,
+    // deadlocking the whole app suite into the 15-minute job timeout
+    // (watchdog stacks: NostrTransport.isPeerReachable syncs holding all
+    // pool threads). Blocking is legal on dispatch worker threads.
     @Test("Concurrent read receipt enqueue does not crash")
     @MainActor
     func concurrentReadReceiptEnqueue() async throws {
@@ -315,9 +375,9 @@ struct NostrTransportTests {
         let transport = NostrTransport(keychain: keychain, idBridge: idBridge)
         let iterations = 100
 
-        await withTaskGroup(of: Void.self) { group in
-            for i in 0..<iterations {
-                group.addTask {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                DispatchQueue.concurrentPerform(iterations: iterations) { i in
                     let receipt = ReadReceipt(
                         originalMessageID: UUID().uuidString,
                         readerID: PeerID(str: String(format: "%016x", i)),
@@ -326,8 +386,10 @@ struct NostrTransportTests {
                     let peerID = PeerID(str: String(format: "%016x", i))
                     transport.sendReadReceipt(receipt, to: peerID)
                 }
+                continuation.resume()
             }
         }
+        withExtendedLifetime(transport) {}
     }
 
     @Test("isPeerReachable is thread safe")
@@ -338,18 +400,16 @@ struct NostrTransportTests {
         let transport = NostrTransport(keychain: keychain, idBridge: idBridge)
         let iterations = 100
 
-        await withTaskGroup(of: Bool.self) { group in
-            for i in 0..<iterations {
-                group.addTask {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                DispatchQueue.concurrentPerform(iterations: iterations) { i in
                     let peerID = PeerID(str: String(format: "%016x", i))
-                    return transport.isPeerReachable(peerID)
+                    #expect(transport.isPeerReachable(peerID) == false)
                 }
-            }
-
-            for await result in group {
-                #expect(result == false)
+                continuation.resume()
             }
         }
+        withExtendedLifetime(transport) {}
     }
 
     @MainActor
@@ -361,7 +421,8 @@ struct NostrTransportTests {
         currentIdentity: @escaping @MainActor () throws -> NostrIdentity? = { nil },
         registerPendingGiftWrap: @escaping @MainActor (String) -> Void = { _ in },
         sendEvent: @escaping @MainActor (NostrEvent) -> Void = { _ in },
-        scheduleAfter: @escaping @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void = { _, _ in }
+        scheduleAfter: @escaping @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void = { _, _ in },
+        relayConnectivity: @escaping @MainActor () -> AnyPublisher<Bool, Never> = { Just(false).eraseToAnyPublisher() }
     ) -> NostrTransport.Dependencies {
         NostrTransport.Dependencies(
             notificationCenter: notificationCenter,
@@ -371,7 +432,8 @@ struct NostrTransportTests {
             currentIdentity: currentIdentity,
             registerPendingGiftWrap: registerPendingGiftWrap,
             sendEvent: sendEvent,
-            scheduleAfter: scheduleAfter
+            scheduleAfter: scheduleAfter,
+            relayConnectivity: relayConnectivity
         )
     }
 

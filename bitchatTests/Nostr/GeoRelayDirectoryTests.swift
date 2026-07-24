@@ -10,7 +10,9 @@ final class GeoRelayDirectoryTests: XCTestCase {
         relay url,lat,lon
         wss://one.example/,10,20
         https://one.example,10,20
+        wss://one.example:443/,10,20
         http://two.example/,11,21
+        wss://two.example:443,11,21
         invalid row
         ws://three.example,not-a-lat,22
         """
@@ -51,6 +53,47 @@ final class GeoRelayDirectoryTests: XCTestCase {
             directory.closestRelays(toGeohash: geohash, count: 2),
             ["wss://close.example", "wss://medium.example"]
         )
+    }
+
+    func test_closestRelays_breaksDistanceTiesDeterministicallyByHost() {
+        // Same coordinates for all entries: selection must still be stable so
+        // publishers and subscribers using the same directory agree on relays.
+        let harness = makeHarness(
+            cacheCSV: """
+            relay url,lat,lon
+            zeta.example,10,10
+            alpha.example,10,10
+            mike.example,10,10
+            """
+        )
+        let directory = GeoRelayDirectory(dependencies: harness.dependencies)
+
+        XCTAssertEqual(
+            directory.closestRelays(toLat: 10, lon: 10, count: 2),
+            ["wss://alpha.example", "wss://mike.example"]
+        )
+    }
+
+    func test_fetchSuccess_postsDirectoryRefreshNotification() async {
+        let harness = makeHarness(fetchCSV: """
+        relay url,lat,lon
+        notify.example,1,2
+        """)
+        let directory = GeoRelayDirectory(dependencies: harness.dependencies)
+
+        var notified = 0
+        let observer = harness.notificationCenter.addObserver(
+            forName: .geoRelayDirectoryDidRefresh,
+            object: nil,
+            queue: .main
+        ) { _ in
+            notified += 1
+        }
+        defer { harness.notificationCenter.removeObserver(observer) }
+
+        directory.prefetchIfNeeded()
+        let refreshed = await waitUntil { notified == 1 }
+        XCTAssertTrue(refreshed)
     }
 
     func test_loadLocalEntries_prefersCacheThenBundleThenWorkingDirectory() {

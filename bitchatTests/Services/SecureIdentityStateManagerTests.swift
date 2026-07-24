@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import BitFoundation
 @testable import bitchat
 
 final class SecureIdentityStateManagerTests: XCTestCase {
@@ -373,6 +374,7 @@ final class SecureIdentityStateManagerTests: XCTestCase {
         XCTAssertTrue(manager.getFavorites().isEmpty)
         XCTAssertTrue(manager.getVerifiedFingerprints().isEmpty)
         XCTAssertTrue(manager.getBlockedNostrPubkeys().isEmpty)
+        XCTAssertNil(keychain.getIdentityKey(forKey: "bitchat.identityCache.v2"))
     }
 
     func test_clearAllIdentityData_removesCachedState() async {
@@ -493,5 +495,9 @@ private final class FailingCacheSaveKeychain: KeychainManagerProtocol {
 
     func delete(key: String, service: String) {
         serviceStorage[service]?.removeValue(forKey: key)
+    }
+
+    func deleteAll(service: String) {
+        serviceStorage.removeValue(forKey: service)
     }
 }
