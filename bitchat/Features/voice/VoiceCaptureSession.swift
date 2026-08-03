@@ -26,6 +26,8 @@ protocol VoiceCaptureSession: AnyObject {
     /// nothing valid was captured.
     func finish() async -> URL?
     func cancel() async
+    /// Stops capture and suppresses every later send before returning.
+    func panicCancelSynchronously()
 }
 
 /// The classic record-then-send backend, wrapping the shared `VoiceRecorder`.
@@ -54,6 +56,10 @@ final class VoiceNoteCaptureSession: VoiceCaptureSession {
 
     func cancel() async {
         await recorder.cancelRecording(owner: owner)
+    }
+
+    func panicCancelSynchronously() {
+        recorder.panicCancelSynchronously(owner: owner)
     }
 }
 
@@ -216,6 +222,13 @@ final class PTTLiveVoiceSession: VoiceCaptureSession {
         }
     }
 
+    func panicCancelSynchronously() {
+        // Do not emit a canceled packet: it would itself be pre-panic
+        // conversation data racing the emergency transport reset.
+        completed = true
+        capture.cancel()
+    }
+
     private func sendControlPacket(_ kind: VoiceBurstPacket.Kind) {
         guard let packet = VoiceBurstPacket(burstID: burstID, seq: stream.packetizer.nextSeq, kind: kind) else { return }
         sendPacket(packet.encode())
@@ -231,7 +244,7 @@ final class PTTLiveVoiceSession: VoiceCaptureSession {
         let directory = base
             .appendingPathComponent("files", isDirectory: true)
             .appendingPathComponent("voicenotes/outgoing", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: BLEIncomingFileStore.mediaProtectionAttributes)
         return directory.appendingPathComponent("voice_\(burstID.hexEncodedString()).m4a")
     }
 }

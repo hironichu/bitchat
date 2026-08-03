@@ -21,6 +21,24 @@ struct BLEOutboundFragmentTransferSchedulerTests {
     }
 
     @Test
+    func explicitTransferIDReservesEncryptedPrivateFileFragments() {
+        var scheduler = BLEOutboundFragmentTransferScheduler()
+        let request = makeRequest(
+            type: MessageType.noiseEncrypted.rawValue,
+            transferId: "private-media"
+        )
+
+        let result = scheduler.submit(request, maxConcurrentTransfers: 1)
+
+        if case let .start(_, reservedTransferId) = result {
+            #expect(reservedTransferId == "private-media")
+            #expect(scheduler.activeCount == 1)
+        } else {
+            Issue.record("Expected encrypted private media to reserve its progress slot")
+        }
+    }
+
+    @Test
     func submitQueuesFileTransferWhenSlotsAreFull() {
         var scheduler = BLEOutboundFragmentTransferScheduler()
         let first = makeRequest(type: MessageType.fileTransfer.rawValue, transferId: "first")
@@ -240,6 +258,48 @@ struct BLEOutboundFragmentTransferSchedulerTests {
         } else {
             Issue.record("Expected pending transfer to reserve the freed slot")
         }
+    }
+
+    @Test
+    func blockedDuplicateAtFrontOfQueueDoesNotStarveALaterUnrelatedPendingTransfer() {
+        // Bug: reservePendingStarts spent the slot budget on a pending
+        // request the moment it was dequeued, before checking whether that
+        // request would actually be admitted. A resend of still-active
+        // content sitting at the front of the queue therefore consumed a
+        // slot even though it was deferred back to the queue rather than
+        // started -- starving an unrelated, genuinely startable transfer
+        // right behind it until some other transfer happened to complete.
+        var scheduler = BLEOutboundFragmentTransferScheduler()
+        let t1 = makeRequest(type: MessageType.fileTransfer.rawValue, transferId: "t1", payload: "file-a")
+        let t2 = makeRequest(type: MessageType.fileTransfer.rawValue, transferId: "t2", payload: "file-b")
+        let dupT1 = makeRequest(type: MessageType.fileTransfer.rawValue, transferId: "t1", payload: "file-a")
+        let unrelated = makeRequest(type: MessageType.fileTransfer.rawValue, transferId: "t3", payload: "file-c")
+
+        _ = scheduler.submit(t1, maxConcurrentTransfers: 2)
+        _ = scheduler.submit(t2, maxConcurrentTransfers: 2)
+        #expect(scheduler.activeCount == 2)
+
+        // Both slots are full, so a resend of "t1" (still active) and an
+        // unrelated transfer both land in the pending queue, in that order.
+        _ = scheduler.submit(dupT1, maxConcurrentTransfers: 2)
+        _ = scheduler.submit(unrelated, maxConcurrentTransfers: 2)
+        #expect(scheduler.pendingCount == 2)
+
+        // "t2" finishes; "t1" stays active, so the queued "t1" resend at the
+        // front of the queue is still blocked when we reserve pending starts.
+        let didActivate = scheduler.activateReservedTransfer(id: "t2", totalFragments: 1, workItems: [])
+        #expect(didActivate)
+        #expect(scheduler.markFragmentSent(transferId: "t2") == .complete(sentFragments: 1, totalFragments: 1))
+
+        let starts = scheduler.reservePendingStarts(maxConcurrentTransfers: 2)
+
+        let startedTransferIds: [String] = starts.compactMap {
+            if case let .start(_, reservedTransferId) = $0 { return reservedTransferId }
+            return nil
+        }
+        #expect(startedTransferIds == ["t3"], "the unrelated pending transfer must start in the same pass despite the blocked front item")
+        #expect(scheduler.activeCount == 2, "t1 (still running) and the newly-started t3")
+        #expect(scheduler.pendingCount == 1, "only the blocked t1 resend remains queued")
     }
 
     @Test

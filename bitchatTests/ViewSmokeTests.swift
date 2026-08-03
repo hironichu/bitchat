@@ -41,6 +41,7 @@ private struct SmokeFeatureModels {
     let conversationUIModel: ConversationUIModel
     let peerListModel: PeerListModel
     let boardAlertsModel: BoardAlertsModel
+    let sharedContentImportModel: SharedContentImportModel
 }
 
 @MainActor
@@ -99,7 +100,8 @@ private func makeSmokeFeatureModels(for viewModel: ChatViewModel) -> SmokeFeatur
         verificationModel: verificationModel,
         conversationUIModel: conversationUIModel,
         peerListModel: peerListModel,
-        boardAlertsModel: boardAlertsModel
+        boardAlertsModel: boardAlertsModel,
+        sharedContentImportModel: SharedContentImportModel(store: nil)
     )
 }
 
@@ -118,6 +120,7 @@ private func installSmokeEnvironment<V: View>(
         .environmentObject(featureModels.conversationUIModel)
         .environmentObject(featureModels.peerListModel)
         .environmentObject(featureModels.boardAlertsModel)
+        .environmentObject(featureModels.sharedContentImportModel)
 }
 
 @MainActor
@@ -539,6 +542,9 @@ struct ViewSmokeTests {
         ])
         try? await Task.sleep(nanoseconds: 50_000_000)
 
+        // ContentView + people sheet must mount with the full feature-model
+        // set (peerList / publicChat / privateInbox included). Missing any of
+        // those crashes the NavigationStack sheet on some iOS versions (#1558).
         _ = mount(installSmokeEnvironment(ContentView(), featureModels: featureModels))
         _ = mount(installSmokeEnvironment(ContentPeopleSheetHarness(), featureModels: featureModels))
 
@@ -549,6 +555,103 @@ struct ViewSmokeTests {
 
         #expect(featureModels.privateConversationModel.selectedPeerID == peerID)
         #expect(featureModels.privateConversationModel.selectedHeaderState?.headerPeerID == peerID)
+    }
+
+    @Test("Root Bluetooth alert waits for location and notices sheets")
+    func rootBluetoothAlertGuard_includesHeaderSheets() {
+        #expect(!ContentRootModalPresentationState().hasPresentation)
+        #expect(
+            ContentRootModalPresentationState(
+                isLocationChannelsSheetPresented: true
+            ).hasPresentation
+        )
+        #expect(
+            ContentRootModalPresentationState(
+                isNoticesSheetPresented: true
+            ).hasPresentation
+        )
+    }
+
+    @Test("People-sheet Bluetooth alert waits for local verification sheet")
+    func peopleSheetBluetoothAlertGuard_includesVerificationSheet() {
+        #expect(!ContentPeopleSheetModalPresentationState().hasPresentation)
+        #expect(
+            ContentPeopleSheetModalPresentationState(
+                isVerificationSheetPresented: true
+            ).hasPresentation
+        )
+    }
+
+    @Test("Bluetooth alerts wait for the voice recording error alert")
+    func bluetoothAlertGuards_includeVoiceAlert() {
+        #expect(
+            ContentRootModalPresentationState(
+                isVoiceAlertPresented: true
+            ).hasPresentation
+        )
+        #expect(
+            ContentPeopleSheetModalPresentationState(
+                isVoiceAlertPresented: true
+            ).hasPresentation
+        )
+    }
+
+    @Test("Root Bluetooth alert waits for screenshot privacy alert")
+    @MainActor
+    func rootBluetoothAlertGuard_tracksScreenshotPrivacyState() {
+        let (viewModel, _, _) = makeSmokeViewModel()
+        let featureModels = makeSmokeFeatureModels(for: viewModel)
+
+        #expect(
+            !ContentRootModalPresentationState(
+                appChromeModel: featureModels.appChromeModel
+            ).hasPresentation
+        )
+
+        featureModels.appChromeModel.showScreenshotPrivacyWarning = true
+
+        #expect(
+            ContentRootModalPresentationState(
+                appChromeModel: featureModels.appChromeModel
+            ).hasPresentation
+        )
+    }
+
+    @Test("People-sheet Bluetooth alert waits for legacy media consent")
+    @MainActor
+    func peopleSheetBluetoothAlertGuard_tracksLegacyConsentState() async {
+        let (viewModel, _, _) = makeSmokeViewModel()
+        let featureModels = makeSmokeFeatureModels(for: viewModel)
+
+        #expect(
+            !ContentPeopleSheetModalPresentationState(
+                legacyPrivateMediaConsentRequest:
+                    featureModels.conversationUIModel
+                        .legacyPrivateMediaConsentRequest
+            ).hasPresentation
+        )
+
+        viewModel.enqueueLegacyPrivateMediaConsent(
+            for: PeerID(str: "5152535455565758"),
+            transferId: "legacy-consent-transfer",
+            messageID: "legacy-consent-message"
+        ) { _ in }
+        defer { viewModel.cancelAllLegacyPrivateMediaConsents() }
+
+        let consentPropagated = await TestHelpers.waitUntil {
+            featureModels.conversationUIModel
+                .legacyPrivateMediaConsentRequest != nil
+        }
+        #expect(
+            consentPropagated
+        )
+        #expect(
+            ContentPeopleSheetModalPresentationState(
+                legacyPrivateMediaConsentRequest:
+                    featureModels.conversationUIModel
+                        .legacyPrivateMediaConsentRequest
+            ).hasPresentation
+        )
     }
 
     @Test
@@ -700,18 +803,29 @@ struct ViewSmokeTests {
         #expect(deliveryStatusSnapshot(of: mediaRow) == read)
     }
 
-    #if os(iOS)
     @Test
     func cameraScannerView_previewAndCoordinatorSmoke() {
+        #if os(iOS) || os(macOS)
+        // Avoid constructing AVCaptureDeviceInput (and the TCC prompt it can
+        // trigger) unless the host process already has camera authorization —
+        // same class of isolation as keeping tests off the login keychain.
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
         let preview = CameraScannerView.PreviewView(frame: .zero)
-        let coordinator = CameraScannerView.Coordinator()
+        let coordinator = CameraScannerCoordinator()
 
+        #if os(iOS)
         _ = CameraScannerView.PreviewView.layerClass
+        #elseif os(macOS)
+        preview.layout()
+        #endif
         _ = preview.videoPreviewLayer
-        coordinator.setup(sessionOwner: preview) { _ in }
-        coordinator.setActive(false)
+
+        if status == .authorized {
+            coordinator.setup(previewLayer: preview.videoPreviewLayer) { _ in }
+            coordinator.setActive(false)
+        }
 
         #expect(preview.videoPreviewLayer.videoGravity == .resizeAspectFill)
+        #endif
     }
-    #endif
 }

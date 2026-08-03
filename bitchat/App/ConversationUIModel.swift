@@ -9,9 +9,11 @@ import UIKit
 final class ConversationUIModel: ObservableObject {
     @Published private(set) var showAutocomplete = false
     @Published private(set) var autocompleteSuggestions: [String] = []
+    @Published private(set) var selectedAutocompleteIndex = 0
     @Published private(set) var currentNickname: String
     @Published private(set) var isBatchingPublic = false
     @Published private(set) var canSendMediaInCurrentContext = true
+    @Published private(set) var legacyPrivateMediaConsentRequest: LegacyPrivateMediaConsentRequest?
     /// Who is talking live in the public mesh channel right now (floor
     /// courtesy: the composer mic tints "busy" while someone holds the floor).
     @Published private(set) var activeLiveVoiceTalker: String?
@@ -35,6 +37,7 @@ final class ConversationUIModel: ObservableObject {
         self.isBatchingPublic = chatViewModel.isBatchingPublic
         self.showAutocomplete = chatViewModel.showAutocomplete
         self.autocompleteSuggestions = chatViewModel.autocompleteSuggestions
+        self.selectedAutocompleteIndex = chatViewModel.selectedAutocompleteIndex
         self.canSendMediaInCurrentContext = chatViewModel.canSendMediaInCurrentContext
 
         bind()
@@ -103,6 +106,31 @@ final class ConversationUIModel: ObservableObject {
         chatViewModel.completeNickname(nickname, in: &text)
     }
 
+    /// Accept the currently highlighted mention suggestion, if any.
+    func completeSelectedSuggestion(in text: inout String) -> Bool {
+        guard showAutocomplete,
+              autocompleteSuggestions.indices.contains(selectedAutocompleteIndex)
+        else { return false }
+        _ = completeNickname(autocompleteSuggestions[selectedAutocompleteIndex], in: &text)
+        return true
+    }
+
+    /// Dismiss the mention suggestion panel without inserting (Escape).
+    func dismissAutocomplete() {
+        guard showAutocomplete else { return }
+        chatViewModel.showAutocomplete = false
+        chatViewModel.autocompleteSuggestions = []
+        chatViewModel.autocompleteRange = nil
+        chatViewModel.selectedAutocompleteIndex = 0
+    }
+
+    func moveAutocompleteSelection(by delta: Int) {
+        guard showAutocomplete, !autocompleteSuggestions.isEmpty else { return }
+        let count = min(4, autocompleteSuggestions.count)
+        let next = (selectedAutocompleteIndex + delta + count) % count
+        chatViewModel.selectedAutocompleteIndex = next
+    }
+
     func formatMessage(_ message: BitchatMessage, colorScheme: ColorScheme, theme: AppTheme? = nil) -> AttributedString {
         chatViewModel.formatMessageAsText(message, colorScheme: colorScheme, theme: theme)
     }
@@ -125,6 +153,18 @@ final class ConversationUIModel: ObservableObject {
 
     func isMediaMessageFromCurrentUser(_ message: BitchatMessage) -> Bool {
         message.sender == currentNickname || message.senderPeerID == chatViewModel.meshService.myPeerID
+    }
+
+    /// Whether a private-message row should show the filled verification seal
+    /// next to the sender name (#1439). Scoped to DMs only — public timelines
+    /// have different trust semantics and stay undressed.
+    func showsVerifiedSeal(for message: BitchatMessage) -> Bool {
+        guard message.isPrivate,
+              message.sender != "system",
+              !isSentByCurrentUser(message),
+              let peerID = message.senderPeerID else { return false }
+        guard let fingerprint = chatViewModel.getFingerprint(for: peerID) else { return false }
+        return chatViewModel.peerIdentityStore.isVerified(fingerprint)
     }
 
     func senderDisplayName(for peerID: PeerID, fallbackMessages: [BitchatMessage]) -> String? {
@@ -151,6 +191,13 @@ final class ConversationUIModel: ObservableObject {
 
     func sendVoiceNote(at url: URL) {
         chatViewModel.sendVoiceNote(at: url)
+    }
+
+    func resolveLegacyPrivateMediaConsent(requestID: UUID, approved: Bool) {
+        chatViewModel.resolveLegacyPrivateMediaConsent(
+            requestID: requestID,
+            approved: approved
+        )
     }
 
     /// Capture backend for the mic gesture: live PTT when the current DM
@@ -185,6 +232,10 @@ final class ConversationUIModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: &$autocompleteSuggestions)
 
+        chatViewModel.$selectedAutocompleteIndex
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$selectedAutocompleteIndex)
+
         chatViewModel.$isBatchingPublic
             .receive(on: DispatchQueue.main)
             .assign(to: &$isBatchingPublic)
@@ -192,6 +243,10 @@ final class ConversationUIModel: ObservableObject {
         chatViewModel.$activePublicVoiceTalker
             .receive(on: DispatchQueue.main)
             .assign(to: &$activeLiveVoiceTalker)
+
+        chatViewModel.$legacyPrivateMediaConsentRequest
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$legacyPrivateMediaConsentRequest)
 
         conversations.$activeChannel
             .receive(on: DispatchQueue.main)
@@ -205,6 +260,15 @@ final class ConversationUIModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.refreshComputedState()
+            }
+            .store(in: &cancellables)
+
+        // Verify/unverify while a DM is open must repaint existing rows —
+        // showsVerifiedSeal is computed per render, so forward the store change.
+        chatViewModel.peerIdentityStore.$verifiedFingerprints
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
             }
             .store(in: &cancellables)
     }
